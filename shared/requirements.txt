@@ -1,3 +1,6 @@
-# Intentionally empty: ingest.py / transform.py use only the standard library
-# so the same code drops into Lambda / Cloud Functions / Azure Functions
-# without a custom deployment package.
+# Core: ingest.py / transform.py use only the standard library so the same
+# code drops into Lambda / Cloud Functions / Azure Functions without a
+# custom deployment package.
+
+# Required by load.py (Kubernetes / local PostgreSQL loading only):
+psycopg2-binary>=2.9,<3

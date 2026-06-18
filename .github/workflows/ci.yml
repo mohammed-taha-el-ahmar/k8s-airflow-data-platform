@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Job 1: Fast lint + unit tests (~30 s) ─────────────────────────
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ruff pytest psycopg2-binary
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Compile DAG (syntax check)
+        run: python -m py_compile dags/pipeline_dag.py
+        env:
+          # Make shared/ importable for the DAG's top-level imports
+          PYTHONPATH: .
+
+      - name: Unit tests
+        run: pytest tests/ -v
+
+  # ─── Job 2: kind smoke test (~8–12 min) ────────────────────────────
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: lint-and-test            # only run if lint passes
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: data-platform
+          wait: 120s
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Verify cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create namespace
+        run: kubectl apply -f manifests/namespace.yaml
+
+      - name: Install Airflow
+        run: |
+          helm repo add apache-airflow https://airflow.apache.org
+          helm repo update
+          helm install airflow apache-airflow/airflow \
+            --namespace data-platform \
+            --set executor=LocalExecutor \
+            --timeout 10m
+
+      - name: Wait for pods
+        run: |
+          echo "Waiting for all pods to be ready..."
+          kubectl wait --for=condition=ready pod \
+            --all -n data-platform \
+            --timeout=300s
+          kubectl get pods -n data-platform
+
+      - name: Copy DAG + shared to scheduler & dag-processor
+        run: |
+          SCHEDULER=$(kubectl get pods -n data-platform \
+            -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
+          DAG_PROC=$(kubectl get pods -n data-platform \
+            -l component=dag-processor -o jsonpath='{.items[0].metadata.name}')
+
+          for POD in $SCHEDULER $DAG_PROC; do
+            echo "Copying to $POD..."
+            kubectl cp dags/pipeline_dag.py  data-platform/$POD:/opt/airflow/dags/pipeline_dag.py
+            kubectl cp shared/               data-platform/$POD:/opt/airflow/dags/shared/
+          done
+
+          # Install psycopg2-binary in scheduler (for the load task)
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+            pip install --quiet psycopg2-binary
+
+      - name: Wait for DAG to be parsed
+        run: |
+          SCHEDULER=$(kubectl get pods -n data-platform \
+            -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Waiting up to 60s for DAG to appear..."
+          for i in $(seq 1 12); do
+            if kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+              airflow dags list 2>/dev/null | grep -q multicloud_pipeline_local; then
+              echo "DAG found after $((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+
+          # Fail fast if DAG didn't parse
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+            airflow dags list 2>/dev/null | grep multicloud_pipeline_local
+
+          # Check for import errors
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+            airflow dags list-import-errors 2>/dev/null
+
+      - name: Trigger DAG run
+        run: |
+          SCHEDULER=$(kubectl get pods -n data-platform \
+            -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
+
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+            airflow dags unpause multicloud_pipeline_local 2>/dev/null || true
+
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+            airflow dags trigger multicloud_pipeline_local 2>/dev/null
+
+      - name: Wait for DAG run to succeed
+        run: |
+          SCHEDULER=$(kubectl get pods -n data-platform \
+            -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Waiting up to 90s for DAG run to complete..."
+          for i in $(seq 1 18); do
+            STATUS=$(kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+              airflow dags list-runs multicloud_pipeline_local 2>/dev/null \
+              | grep manual | head -1 | awk '{print $5}' || echo "pending")
+
+            echo "  Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "success" ]; then
+              echo "✅ DAG run succeeded!"
+              break
+            elif [ "$STATUS" = "failed" ]; then
+              echo "❌ DAG run failed!"
+              kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+                airflow dags list-runs multicloud_pipeline_local 2>/dev/null
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Final check
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+            airflow dags list-runs multicloud_pipeline_local 2>/dev/null \
+            | grep -q success || { echo "❌ No successful run found"; exit 1; }
+
+      - name: Verify data in PostgreSQL
+        run: |
+          ROW_COUNT=$(kubectl exec airflow-postgresql-0 -n data-platform -- \
+            env PGPASSWORD=postgres psql -U postgres -t -c \
+            "SELECT count(*) FROM weather_observations;" 2>/dev/null | tr -d ' ')
+
+          echo "Rows in weather_observations: $ROW_COUNT"
+
+          if [ "$ROW_COUNT" -gt 0 ] 2>/dev/null; then
+            echo "✅ Data landed successfully!"
+            kubectl exec airflow-postgresql-0 -n data-platform -- \
+              env PGPASSWORD=postgres psql -U postgres -c \
+              "SELECT id, ingested_at, temperature_c, wind_speed_kmh, humidity_pct
+               FROM weather_observations ORDER BY ingested_at DESC LIMIT 5;"
+          else
+            echo "❌ No data found in weather_observations"
+            exit 1
+          fi
+
+      - name: Build dashboard image
+        run: docker build -t pipeline-dashboard:latest dashboard/
+
+      - name: Load dashboard into kind & deploy
+        run: |
+          kind load docker-image pipeline-dashboard:latest --name data-platform
+          kubectl apply -f manifests/dashboard.yaml
+          kubectl wait --for=condition=ready pod \
+            -l app=dashboard -n data-platform \
+            --timeout=120s
+          echo "✅ Dashboard pod is running!"
+
+      - name: Dump debug info on failure
+        if: failure()
+        run: |
+          echo "=== Pod status ==="
+          kubectl get pods -n data-platform
+          echo ""
+          echo "=== Events ==="
+          kubectl get events -n data-platform --sort-by='.lastTimestamp' | tail -30
+          echo ""
+          echo "=== Scheduler logs (last 50 lines) ==="
+          kubectl logs sts/airflow-scheduler -c scheduler -n data-platform --tail=50 || true
+          echo ""
+          echo "=== DAG processor logs (last 50 lines) ==="
+          kubectl logs deploy/airflow-dag-processor -c dag-processor -n data-platform --tail=50 || true

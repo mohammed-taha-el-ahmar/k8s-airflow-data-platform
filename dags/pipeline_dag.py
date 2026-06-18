@@ -9,9 +9,16 @@ Requires shared/ to be importable from the Airflow worker (see k8s/README.md).
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+
+try:
+    # Airflow 3.x
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:
+    # Airflow 2.x fallback
+    from airflow.operators.python import PythonOperator
 
 from shared.ingest import fetch_data, to_raw_record
+from shared.load import load_row
 from shared.transform import transform_record
 
 default_args = {
@@ -21,7 +28,7 @@ default_args = {
 
 with DAG(
     dag_id="multicloud_pipeline_local",
-    description="Ingest + transform, orchestrated on Kubernetes via Airflow",
+    description="Ingest + transform + load, orchestrated on Kubernetes via Airflow",
     schedule="@hourly",
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -35,12 +42,15 @@ with DAG(
     def _transform(**context):
         raw = context["ti"].xcom_pull(key="raw", task_ids="ingest")
         row = transform_record(raw)
+        context["ti"].xcom_push(key="row", value=row)
 
-        # TODO: load `row` into the warehouse of your choice
-        # (local Postgres, Redshift, BigQuery, or Azure SQL).
-        print("Transformed row:", row)
+    def _load(**context):
+        row = context["ti"].xcom_pull(key="row", task_ids="transform")
+        row_id = load_row(row)
+        print(f"Loaded row id={row_id}: {row}")
 
     ingest = PythonOperator(task_id="ingest", python_callable=_ingest)
     transform = PythonOperator(task_id="transform", python_callable=_transform)
+    load = PythonOperator(task_id="load", python_callable=_load)
 
-    ingest >> transform
+    ingest >> transform >> load
