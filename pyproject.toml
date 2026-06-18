@@ -22,7 +22,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"dags/*" = ["F401"]              # re-exports / Airflow DAG pattern
+"dags/*" = ["F401", "I001"]      # re-exports / Airflow DAG pattern; try/except breaks isort
 "dashboard/*" = ["E402"]         # streamlit requires set_page_config before other imports
 
 [tool.ruff.format]
