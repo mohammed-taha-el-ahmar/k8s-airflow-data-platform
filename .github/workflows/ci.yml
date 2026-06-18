@@ -94,23 +94,45 @@ jobs:
           DAG_PROC=$(kubectl get pods -n data-platform \
             -l component=dag-processor -o jsonpath='{.items[0].metadata.name}')
 
-          for POD in $SCHEDULER $DAG_PROC; do
-            echo "Copying to $POD..."
-            kubectl cp dags/pipeline_dag.py  data-platform/$POD:/opt/airflow/dags/pipeline_dag.py
-            kubectl cp shared/               data-platform/$POD:/opt/airflow/dags/shared/
-          done
+          # Copy to scheduler (specify -c scheduler for multi-container pod)
+          echo "Copying to $SCHEDULER (scheduler container)..."
+          kubectl cp dags/pipeline_dag.py data-platform/$SCHEDULER:/opt/airflow/dags/pipeline_dag.py -c scheduler
+          kubectl cp shared/              data-platform/$SCHEDULER:/opt/airflow/dags/shared/         -c scheduler
+
+          # Copy to dag-processor (specify -c dag-processor for multi-container pod)
+          echo "Copying to $DAG_PROC (dag-processor container)..."
+          kubectl cp dags/pipeline_dag.py data-platform/$DAG_PROC:/opt/airflow/dags/pipeline_dag.py  -c dag-processor
+          kubectl cp shared/              data-platform/$DAG_PROC:/opt/airflow/dags/shared/          -c dag-processor
 
           # Install psycopg2-binary in scheduler (for the load task)
           kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
             pip install --quiet psycopg2-binary
 
+          # Verify files landed
+          echo "--- Files in scheduler ---"
+          kubectl exec $SCHEDULER -c scheduler -n data-platform -- ls -R /opt/airflow/dags/
+          echo "--- Files in dag-processor ---"
+          kubectl exec $DAG_PROC -c dag-processor -n data-platform -- ls -R /opt/airflow/dags/
+
+          # Restart dag-processor so it rescans immediately
+          kubectl rollout restart deploy/airflow-dag-processor -n data-platform
+          kubectl wait --for=condition=ready pod \
+            -l component=dag-processor -n data-platform --timeout=120s
+
       - name: Wait for DAG to be parsed
         run: |
           SCHEDULER=$(kubectl get pods -n data-platform \
             -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
+          DAG_PROC=$(kubectl get pods -n data-platform \
+            -l component=dag-processor -o jsonpath='{.items[0].metadata.name}')
 
-          echo "Waiting up to 60s for DAG to appear..."
-          for i in $(seq 1 12); do
+          # After restart, re-copy files to the new dag-processor pod
+          echo "Re-copying DAG files to new dag-processor pod..."
+          kubectl cp dags/pipeline_dag.py data-platform/$DAG_PROC:/opt/airflow/dags/pipeline_dag.py  -c dag-processor
+          kubectl cp shared/              data-platform/$DAG_PROC:/opt/airflow/dags/shared/          -c dag-processor
+
+          echo "Waiting up to 90s for DAG to appear..."
+          for i in $(seq 1 18); do
             if kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
               airflow dags list 2>/dev/null | grep -q multicloud_pipeline_local; then
               echo "DAG found after $((i * 5))s"
