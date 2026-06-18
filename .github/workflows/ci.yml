@@ -123,13 +123,20 @@ jobs:
         run: |
           SCHEDULER=$(kubectl get pods -n data-platform \
             -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
-          DAG_PROC=$(kubectl get pods -n data-platform \
-            -l component=dag-processor -o jsonpath='{.items[0].metadata.name}')
 
-          # After restart, re-copy files to the new dag-processor pod
-          echo "Re-copying DAG files to new dag-processor pod..."
+          # Re-fetch dag-processor pod name (changed after rollout restart)
+          DAG_PROC=$(kubectl get pods -n data-platform \
+            -l component=dag-processor --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+          echo "New dag-processor pod: $DAG_PROC"
+
+          # Copy files to the new dag-processor pod
+          echo "Copying DAG files to new dag-processor pod..."
           kubectl cp dags/pipeline_dag.py data-platform/$DAG_PROC:/opt/airflow/dags/pipeline_dag.py  -c dag-processor
           kubectl cp shared/              data-platform/$DAG_PROC:/opt/airflow/dags/shared/          -c dag-processor
+
+          # Verify files in new pod
+          kubectl exec $DAG_PROC -c dag-processor -n data-platform -- ls -R /opt/airflow/dags/
 
           echo "Waiting up to 90s for DAG to appear..."
           for i in $(seq 1 18); do
