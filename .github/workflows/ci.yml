@@ -108,53 +108,35 @@ jobs:
           kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
             pip install --quiet psycopg2-binary
 
-          # Verify files landed
+          # Verify files landed in both pods
           echo "--- Files in scheduler ---"
           kubectl exec $SCHEDULER -c scheduler -n data-platform -- ls -R /opt/airflow/dags/
           echo "--- Files in dag-processor ---"
           kubectl exec $DAG_PROC -c dag-processor -n data-platform -- ls -R /opt/airflow/dags/
-
-          # Restart dag-processor so it rescans immediately
-          kubectl rollout restart deploy/airflow-dag-processor -n data-platform
-          kubectl wait --for=condition=ready pod \
-            -l component=dag-processor -n data-platform --timeout=120s
 
       - name: Wait for DAG to be parsed
         run: |
           SCHEDULER=$(kubectl get pods -n data-platform \
             -l component=scheduler -o jsonpath='{.items[0].metadata.name}')
 
-          # Re-fetch dag-processor pod name (changed after rollout restart)
-          DAG_PROC=$(kubectl get pods -n data-platform \
-            -l component=dag-processor --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}')
-          echo "New dag-processor pod: $DAG_PROC"
-
-          # Copy files to the new dag-processor pod
-          echo "Copying DAG files to new dag-processor pod..."
-          kubectl cp dags/pipeline_dag.py data-platform/$DAG_PROC:/opt/airflow/dags/pipeline_dag.py  -c dag-processor
-          kubectl cp shared/              data-platform/$DAG_PROC:/opt/airflow/dags/shared/          -c dag-processor
-
-          # Verify files in new pod
-          kubectl exec $DAG_PROC -c dag-processor -n data-platform -- ls -R /opt/airflow/dags/
-
-          echo "Waiting up to 90s for DAG to appear..."
-          for i in $(seq 1 18); do
+          echo "Waiting up to 120s for dag-processor to detect and parse the DAG..."
+          for i in $(seq 1 24); do
             if kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
               airflow dags list 2>/dev/null | grep -q multicloud_pipeline_local; then
-              echo "DAG found after $((i * 5))s"
+              echo "✅ DAG found after $((i * 5))s"
               break
             fi
+            echo "  Attempt $i/24 — not yet..."
             sleep 5
           done
 
           # Fail fast if DAG didn't parse
           kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
-            airflow dags list 2>/dev/null | grep multicloud_pipeline_local
-
-          # Check for import errors
-          kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
-            airflow dags list-import-errors 2>/dev/null
+            airflow dags list 2>/dev/null | grep multicloud_pipeline_local \
+            || { echo "❌ DAG not found after 120s"; \
+                 kubectl exec $SCHEDULER -c scheduler -n data-platform -- \
+                   airflow dags list-import-errors 2>/dev/null; \
+                 exit 1; }
 
       - name: Trigger DAG run
         run: |
