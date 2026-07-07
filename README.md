@@ -1,6 +1,6 @@
 # Kubernetes Capstone — Airflow on K8s
 
-[![CI](https://github.com/<your-username>/k8s-airflow-data-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-username>/k8s-airflow-data-platform/actions/workflows/ci.yml)
+[![CI](https://github.com/mohammed-taha-el-ahmar/k8s-airflow-data-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/mohammed-taha-el-ahmar/k8s-airflow-data-platform/actions/workflows/ci.yml)
 
 > Part of a multi-cloud data engineering pattern — see `PORTFOLIO.md` in the
 > companion repos for the cross-cloud comparison. Same `shared/` ingest +
